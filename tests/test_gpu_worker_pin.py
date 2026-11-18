@@ -3,6 +3,7 @@
 """
 import importlib.machinery
 import importlib.util
+import io
 import os
 import unittest
 from unittest import mock
@@ -15,13 +16,23 @@ loader.exec_module(k)
 
 # SM8550: three A510s, four middle cores, one X3.
 CAPS = {0: 222, 1: 222, 2: 222, 3: 657, 4: 657, 5: 657, 6: 657, 7: 1024}
+FREQS = {0: 2016000, 1: 2016000, 2: 2016000, 3: 2803200, 4: 2803200, 5: 2803200, 6: 2803200, 7: 3187200}
+KTHREAD = 0x00208040  # PF_KTHREAD | PF_NOFREEZE | PF_FORKNOEXEC, as msm's kthread worker has
+USER = 0x00400100     # PF_RANDOMIZE | PF_SUPERPRIV: an ordinary process
+
+
+def stat(pid, comm, flags):
+    return b"%d (%s) S 2 0 0 0 -1 %d 0 0 0 0 0 0 0 0 -51 0 1 0 220 0 0" % (pid, comm, flags)
 
 
 class GpuWorkerPin(unittest.TestCase):
     def setUp(self):
         self.files = {f"/sys/devices/system/cpu/cpu{c}/cpu_capacity": str(v) for c, v in CAPS.items()}
-        self.files.update({"/proc/1/comm": "systemd", "/proc/151/comm": "gpu-worker",
-                           "/proc/152/comm": "kworker/0:1H"})
+        self.files.update({f"/sys/devices/system/cpu/cpu{c}/cpufreq/cpuinfo_max_freq": str(v)
+                           for c, v in FREQS.items()})
+        self.stats = {"/proc/1/stat": stat(1, b"systemd", USER),
+                      "/proc/151/stat": stat(151, b"gpu-worker", KTHREAD),
+                      "/proc/152/stat": stat(152, b"kworker/0:1H", KTHREAD)}
         self.aff = {151: set(range(8))}
         self.set_calls = []
 
@@ -29,12 +40,17 @@ class GpuWorkerPin(unittest.TestCase):
         self.set_calls.append((pid, set(mask)))
         self.aff[pid] = set(mask)
 
+    def open_stat(self, path, mode="r", *a, **kw):
+        if path not in self.stats:
+            raise FileNotFoundError(path)
+        return io.BytesIO(self.stats[path])
+
     def run_pin(self, sm8550=True, big=None):
-        procs = [p for p in self.files if p.startswith("/proc/")]
         with mock.patch.object(k, "is_sm8550", return_value=sm8550), \
-                mock.patch.object(k, "big_cpus", return_value=big or {3, 4, 5, 6, 7}), \
+                mock.patch.object(k, "big_cpus", return_value={3, 4, 5, 6, 7} if big is None else big), \
                 mock.patch.object(k, "rd", side_effect=lambda p, d="": self.files.get(p, d)), \
-                mock.patch.object(k.glob, "glob", return_value=procs), \
+                mock.patch.object(k, "open", side_effect=self.open_stat, create=True), \
+                mock.patch.object(k.glob, "glob", return_value=list(self.stats)), \
                 mock.patch.object(k.os, "sched_getaffinity", side_effect=lambda pid: set(self.aff[pid])), \
                 mock.patch.object(k.os, "sched_setaffinity", side_effect=self.setaffinity), \
                 mock.patch.object(k, "log"):
@@ -57,8 +73,33 @@ class GpuWorkerPin(unittest.TestCase):
         self.run_pin(big={3, 4, 5, 6})
         self.assertEqual(self.set_calls, [(151, {3, 4, 5, 6})])
 
+    def test_no_big_cpus_no_write(self):
+        self.run_pin(big=set())
+        self.assertEqual(self.set_calls, [])
+
     def test_no_thread_no_write(self):
-        del self.files["/proc/151/comm"]
+        del self.stats["/proc/151/stat"]
+        self.run_pin()
+        self.assertEqual(self.set_calls, [])
+
+    def test_user_process_with_the_name_left_alone(self):
+        self.stats["/proc/151/stat"] = stat(151, b"gpu-worker", USER)
+        self.run_pin()
+        self.assertEqual(self.set_calls, [])
+
+    def test_non_utf8_name_does_not_stop_the_pass(self):
+        self.stats = {"/proc/90/stat": stat(90, b"\xff\xfe bad", USER), **self.stats}
+        self.run_pin()
+        self.assertEqual(self.set_calls, [(151, {3, 4, 5, 6})])
+
+    def test_unreadable_capacity_ranks_all_by_frequency(self):
+        del self.files["/sys/devices/system/cpu/cpu7/cpu_capacity"]
+        self.run_pin()
+        self.assertEqual(self.set_calls, [(151, {3, 4, 5, 6})])
+
+    def test_no_ranking_no_write(self):
+        del self.files["/sys/devices/system/cpu/cpu7/cpu_capacity"]
+        del self.files["/sys/devices/system/cpu/cpu7/cpufreq/cpuinfo_max_freq"]
         self.run_pin()
         self.assertEqual(self.set_calls, [])
 

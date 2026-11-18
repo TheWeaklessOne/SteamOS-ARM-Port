@@ -797,22 +797,43 @@ def pin_gpu_irqs() -> None:
 # waits behind it: a Moonlight stream on the Odin 2 Portal then misses about
 # three times as many refreshes. Keep it on the middle cores, next to the GPU
 # interrupts above, but not on the prime core, the hottest one. SM8550 only.
+PF_KTHREAD = 0x00200000
+
+
+def kthread_comm(stat_path: str) -> bytes:
+    """A kernel thread's comm from /proc/<pid>/stat, b"" for anything else.
+    comm is raw bytes any process can set on itself, so the kernel-thread flag
+    (field 9) decides, and the name is compared as bytes, never decoded."""
+    try:
+        with open(stat_path, "rb") as fh:
+            stat = fh.read()
+        r = stat.rfind(b")")
+        flags = int(stat[r + 2:].split()[6])
+    except (OSError, ValueError, IndexError):
+        return b""
+    return stat[stat.find(b"(") + 1:r] if flags & PF_KTHREAD else b""
+
+
 def pin_gpu_worker() -> None:
     if not is_sm8550():
         return
-    big = big_cpus()
+    big = sorted(big_cpus())
+    # One ranking for every big CPU: capacity, else the max frequency. When
+    # neither is readable on all of them the prime core is unknown: leave it.
     caps = {}
-    for c in big:
-        v = rd(f"/sys/devices/system/cpu/cpu{c}/cpu_capacity")
-        caps[c] = int(v) if v.isdigit() else 0
-    top = max(caps.values(), default=0)
-    want = {c for c, v in caps.items() if v < top} or big
-    if not want:
+    for attr in ("cpu_capacity", "cpufreq/cpuinfo_max_freq"):
+        vals = [rd(f"/sys/devices/system/cpu/cpu{c}/{attr}") for c in big]
+        if big and all(v.isdigit() and int(v) > 0 for v in vals):
+            caps = dict(zip(big, map(int, vals)))
+            break
+    if not caps:
         return
-    for comm in glob.glob("/proc/[0-9]*/comm"):
-        if rd(comm) != "gpu-worker":
+    top = max(caps.values())
+    want = {c for c, v in caps.items() if v < top} or set(big)
+    for stat in glob.glob("/proc/[0-9]*/stat"):
+        if kthread_comm(stat) != b"gpu-worker":
             continue
-        pid = int(comm.split("/")[2])
+        pid = int(stat.split("/")[2])
         try:
             if os.sched_getaffinity(pid) != want:
                 os.sched_setaffinity(pid, want)
