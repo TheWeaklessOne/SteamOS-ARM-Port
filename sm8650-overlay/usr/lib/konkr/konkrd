@@ -791,6 +791,36 @@ def pin_gpu_irqs() -> None:
             log(f"gpu irq {irq} -> cpus {want}")
 
 
+# msm's "gpu-worker" kernel thread (SCHED_FIFO) retires finished GPU jobs. The
+# Wi-Fi receive interrupts stay on the little cores (irqaffinity=0-2), and when
+# a stream's receive softirq runs on the CPU this thread sits on, the thread
+# waits behind it: a Moonlight stream on the Odin 2 Portal then misses about
+# three times as many refreshes. Keep it on the middle cores, next to the GPU
+# interrupts above, but not on the prime core, the hottest one. SM8550 only.
+def pin_gpu_worker() -> None:
+    if not is_sm8550():
+        return
+    big = big_cpus()
+    caps = {}
+    for c in big:
+        v = rd(f"/sys/devices/system/cpu/cpu{c}/cpu_capacity")
+        caps[c] = int(v) if v.isdigit() else 0
+    top = max(caps.values(), default=0)
+    want = {c for c, v in caps.items() if v < top} or big
+    if not want:
+        return
+    for comm in glob.glob("/proc/[0-9]*/comm"):
+        if rd(comm) != "gpu-worker":
+            continue
+        pid = int(comm.split("/")[2])
+        try:
+            if os.sched_getaffinity(pid) != want:
+                os.sched_setaffinity(pid, want)
+                log(f"gpu-worker {pid} -> cpus {','.join(str(c) for c in sorted(want))}")
+        except OSError:
+            pass
+
+
 def ensure_webhelper_vulkan() -> None:
     """Re-apply the ANGLE-Vulkan flags if a Steam client update rewrote the
     launcher (Steam restarts the UI on its own after updates)."""
@@ -1721,6 +1751,7 @@ class Daemon:
                 next_ui_check = now + 60.0
                 ensure_webhelper_vulkan()
                 pin_gpu_irqs()
+                pin_gpu_worker()
                 record_wifi()
                 if not os.path.exists(STANDBY_FLAG):
                     ensure_gamepad_mode(self.conf)
