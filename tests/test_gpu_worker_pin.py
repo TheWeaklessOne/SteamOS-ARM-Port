@@ -33,8 +33,17 @@ class GpuWorkerPin(unittest.TestCase):
         self.stats = {"/proc/1/stat": stat(1, b"systemd", USER),
                       "/proc/151/stat": stat(151, b"gpu-worker", KTHREAD),
                       "/proc/152/stat": stat(152, b"kworker/0:1H", KTHREAD)}
+        self.cpus = list(CAPS)
         self.aff = {151: set(range(8))}
         self.set_calls = []
+
+    def drop(self, cpu, attr):
+        del self.files[f"/sys/devices/system/cpu/cpu{cpu}/{attr}"]
+
+    def glob(self, pattern):
+        if pattern.startswith("/sys/devices/system/cpu/"):
+            return [f"/sys/devices/system/cpu/cpu{c}" for c in self.cpus]
+        return list(self.stats)
 
     def setaffinity(self, pid, mask):
         self.set_calls.append((pid, set(mask)))
@@ -45,12 +54,11 @@ class GpuWorkerPin(unittest.TestCase):
             raise FileNotFoundError(path)
         return io.BytesIO(self.stats[path])
 
-    def run_pin(self, sm8550=True, big=None):
+    def run_pin(self, sm8550=True):
         with mock.patch.object(k, "is_sm8550", return_value=sm8550), \
-                mock.patch.object(k, "big_cpus", return_value={3, 4, 5, 6, 7} if big is None else big), \
                 mock.patch.object(k, "rd", side_effect=lambda p, d="": self.files.get(p, d)), \
                 mock.patch.object(k, "open", side_effect=self.open_stat, create=True), \
-                mock.patch.object(k.glob, "glob", return_value=list(self.stats)), \
+                mock.patch.object(k.glob, "glob", side_effect=self.glob), \
                 mock.patch.object(k.os, "sched_getaffinity", side_effect=lambda pid: set(self.aff[pid])), \
                 mock.patch.object(k.os, "sched_setaffinity", side_effect=self.setaffinity), \
                 mock.patch.object(k, "log"):
@@ -70,11 +78,20 @@ class GpuWorkerPin(unittest.TestCase):
         self.assertEqual(self.set_calls, [])
 
     def test_one_big_cluster_keeps_all_of_it(self):
-        self.run_pin(big={3, 4, 5, 6})
-        self.assertEqual(self.set_calls, [(151, {3, 4, 5, 6})])
+        self.files["/sys/devices/system/cpu/cpu7/cpu_capacity"] = str(CAPS[3])
+        self.run_pin()
+        self.assertEqual(self.set_calls, [(151, {3, 4, 5, 6, 7})])
 
-    def test_no_big_cpus_no_write(self):
-        self.run_pin(big=set())
+    def test_no_cpus_no_write(self):
+        self.cpus = []
+        self.run_pin()
+        self.assertEqual(self.set_calls, [])
+
+    def test_one_tier_no_write(self):
+        for c in CAPS:
+            self.files[f"/sys/devices/system/cpu/cpu{c}/cpu_capacity"] = "1024"
+        self.aff[151] = {0}
+        self.run_pin()
         self.assertEqual(self.set_calls, [])
 
     def test_no_thread_no_write(self):
@@ -93,13 +110,31 @@ class GpuWorkerPin(unittest.TestCase):
         self.assertEqual(self.set_calls, [(151, {3, 4, 5, 6})])
 
     def test_unreadable_capacity_ranks_all_by_frequency(self):
-        del self.files["/sys/devices/system/cpu/cpu7/cpu_capacity"]
+        self.drop(7, "cpu_capacity")
+        self.run_pin()
+        self.assertEqual(self.set_calls, [(151, {3, 4, 5, 6})])
+
+    def test_unreadable_little_capacity_stays_off_the_wifi_cores(self):
+        # A per-CPU fallback would rank CPU0 by kHz against the others'
+        # capacities, put it in the big set and the mask on {0,3,4,5,6}.
+        self.drop(0, "cpu_capacity")
+        self.run_pin()
+        self.assertEqual(self.set_calls, [(151, {3, 4, 5, 6})])
+
+    def test_unreadable_middle_capacity_ranks_all_by_frequency(self):
+        self.drop(3, "cpu_capacity")
         self.run_pin()
         self.assertEqual(self.set_calls, [(151, {3, 4, 5, 6})])
 
     def test_no_ranking_no_write(self):
-        del self.files["/sys/devices/system/cpu/cpu7/cpu_capacity"]
-        del self.files["/sys/devices/system/cpu/cpu7/cpufreq/cpuinfo_max_freq"]
+        self.drop(7, "cpu_capacity")
+        self.drop(7, "cpufreq/cpuinfo_max_freq")
+        self.run_pin()
+        self.assertEqual(self.set_calls, [])
+
+    def test_no_ranking_for_a_little_core_no_write(self):
+        self.drop(0, "cpu_capacity")
+        self.drop(1, "cpufreq/cpuinfo_max_freq")
         self.run_pin()
         self.assertEqual(self.set_calls, [])
 

@@ -814,22 +814,34 @@ def kthread_comm(stat_path: str) -> bytes:
     return stat[stat.find(b"(") + 1:r] if flags & PF_KTHREAD else b""
 
 
+def cpu_ranks() -> dict[int, int]:
+    """Every CPU ranked from one source: cpu_capacity, else cpuinfo_max_freq.
+    {} when neither is readable on all CPUs, so a capacity is never compared
+    with a frequency (big_cpus() falls back per CPU, which can put a little
+    core with an unreadable capacity above the others)."""
+    cpus = sorted(int(os.path.basename(c)[3:]) for c in glob.glob("/sys/devices/system/cpu/cpu[0-9]*")
+                  if os.path.basename(c)[3:].isdigit())
+    for attr in ("cpu_capacity", "cpufreq/cpuinfo_max_freq"):
+        vals = [rd(f"/sys/devices/system/cpu/cpu{c}/{attr}") for c in cpus]
+        if cpus and all(v.isdigit() and int(v) > 0 for v in vals):
+            return dict(zip(cpus, map(int, vals)))
+    return {}
+
+
 def pin_gpu_worker() -> None:
     if not is_sm8550():
         return
-    big = sorted(big_cpus())
-    # One ranking for every big CPU: capacity, else the max frequency. When
-    # neither is readable on all of them the prime core is unknown: leave it.
-    caps = {}
-    for attr in ("cpu_capacity", "cpufreq/cpuinfo_max_freq"):
-        vals = [rd(f"/sys/devices/system/cpu/cpu{c}/{attr}") for c in big]
-        if big and all(v.isdigit() and int(v) > 0 for v in vals):
-            caps = dict(zip(big, map(int, vals)))
-            break
-    if not caps:
+    # The little and prime tiers come from one ranking of every CPU. When no
+    # source covers them all, or all CPUs rank the same, the tiers are
+    # unknown: leave the thread where it is.
+    ranks = cpu_ranks()
+    if not ranks:
         return
-    top = max(caps.values())
-    want = {c for c, v in caps.items() if v < top} or set(big)
+    low, top = min(ranks.values()), max(ranks.values())
+    big = {c for c, v in ranks.items() if v > low}
+    if not big:
+        return
+    want = {c for c in big if ranks[c] < top} or big
     for stat in glob.glob("/proc/[0-9]*/stat"):
         if kthread_comm(stat) != b"gpu-worker":
             continue
