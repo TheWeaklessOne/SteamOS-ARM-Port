@@ -78,9 +78,10 @@ class FastScan(unittest.TestCase):
         self.assertEqual(args, [b"dev", b"wlan0", b"scan", b"trigger", b"freq", b"5180"])
 
     def test_no_scan_without_a_network(self):
-        self.tool("iw", f'echo called >>"{self.args}"\n')
         open(self.args, "w").close()
         self.assertEqual(self.scan("garbage\n\n"), [])
+        with open(self.args, "rb") as fh:
+            self.assertEqual(fh.read(), b"", "iw was called")
 
 
 if __name__ == "__main__":
